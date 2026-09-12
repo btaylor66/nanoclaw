@@ -26,7 +26,14 @@ import {
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  RUNTIME_CLI_TIMEOUT_MS,
+  hostGatewayArgs,
+  isRuntimeTimeout,
+  readonlyMountArgs,
+  stopContainerAsync,
+} from './container-runtime.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -223,11 +230,43 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   }
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
-  try {
-    stopContainer(entry.containerName);
-  } catch {
-    entry.process.kill('SIGKILL');
-  }
+  // Async so a hung daemon can't block the event loop.
+  //
+  // - Timed out: the container's state is unknown (daemon slow or hung).
+  //   Leave the entry in place so the next sweep tick retries the stop. Do
+  //   NOT kill the `docker run` client here — dropping the entry while the
+  //   container may still be alive would let the sweep spawn a second
+  //   container onto the same session directory (two writers on outbound.db).
+  // - Any other error (e.g. "No such container"): the container is gone or
+  //   unreachable, so kill the run client — its 'close' event still fires
+  //   (onExit, activeContainers cleanup), as before this became async. A
+  //   process that already closed is skipped (kill() would be a no-op anyway).
+  stopContainerAsync(entry.containerName).catch((err: unknown) => {
+    if (isRuntimeTimeout(err)) {
+      log.warn('Container stop timed out — will retry on the next sweep', {
+        sessionId,
+        containerName: entry.containerName,
+        timeoutMs: RUNTIME_CLI_TIMEOUT_MS,
+      });
+      return;
+    }
+    log.warn('Container stop failed — force-killing the run process', {
+      sessionId,
+      containerName: entry.containerName,
+      err,
+    });
+    if (entry.process.exitCode === null && !entry.process.killed) {
+      entry.process.kill('SIGKILL');
+    }
+  });
+}
+
+/** Test-only: register a fake active container so killContainer can be exercised. */
+export function _setActiveContainerForTesting(
+  sessionId: string,
+  entry: { process: ChildProcess; containerName: string },
+): void {
+  activeContainers.set(sessionId, entry);
 }
 
 /**

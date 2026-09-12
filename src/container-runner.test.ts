@@ -1,8 +1,108 @@
+import type { ChildProcess } from 'child_process';
+import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { hardeningArgs, resolveProviderName } from './container-runner.js';
+vi.mock('./log.js', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+}));
+
+vi.mock('./container-runtime.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./container-runtime.js')>();
+  return { ...actual, stopContainerAsync: vi.fn() };
+});
+
+import { stopContainerAsync } from './container-runtime.js';
+import {
+  _setActiveContainerForTesting,
+  hardeningArgs,
+  isContainerRunning,
+  killContainer,
+  resolveProviderName,
+} from './container-runner.js';
+import { log } from './log.js';
+
+/** A stand-in for the `docker run` child: an emitter with a recorded kill(). */
+function fakeRunProcess() {
+  const proc = new EventEmitter() as EventEmitter & {
+    kill: ReturnType<typeof vi.fn>;
+    exitCode: number | null;
+    killed: boolean;
+  };
+  proc.kill = vi.fn();
+  proc.exitCode = null;
+  proc.killed = false;
+  return proc;
+}
+
+/** Let the stop promise's rejection handler run. */
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+describe('killContainer', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('leaves the entry in place when the stop times out, so the next sweep retries', async () => {
+    const proc = fakeRunProcess();
+    _setActiveContainerForTesting('sess-timeout', {
+      process: proc as unknown as ChildProcess,
+      containerName: 'nanoclaw-v2-test-1',
+    });
+    vi.mocked(stopContainerAsync).mockRejectedValueOnce(
+      Object.assign(new Error('timed out'), { killed: true, signal: 'SIGKILL' }),
+    );
+
+    killContainer('sess-timeout', 'absolute-ceiling');
+    await settle();
+
+    expect(stopContainerAsync).toHaveBeenCalledWith('nanoclaw-v2-test-1');
+    expect(proc.kill).not.toHaveBeenCalled();
+    expect(isContainerRunning('sess-timeout')).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Container stop timed out — will retry on the next sweep',
+      expect.objectContaining({ sessionId: 'sess-timeout' }),
+    );
+  });
+
+  it('force-kills the run client on any other stop error, so onExit still fires', async () => {
+    const proc = fakeRunProcess();
+    _setActiveContainerForTesting('sess-gone', {
+      process: proc as unknown as ChildProcess,
+      containerName: 'nanoclaw-v2-test-2',
+    });
+    vi.mocked(stopContainerAsync).mockRejectedValueOnce(new Error('No such container'));
+    const onExit = vi.fn();
+
+    killContainer('sess-gone', 'claim-stuck', onExit);
+    await settle();
+
+    expect(proc.kill).toHaveBeenCalledWith('SIGKILL');
+    proc.emit('close');
+    expect(onExit).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not kill a run client that has already exited', async () => {
+    const proc = fakeRunProcess();
+    proc.exitCode = 0;
+    _setActiveContainerForTesting('sess-exited', {
+      process: proc as unknown as ChildProcess,
+      containerName: 'nanoclaw-v2-test-3',
+    });
+    vi.mocked(stopContainerAsync).mockRejectedValueOnce(new Error('No such container'));
+
+    killContainer('sess-exited', 'absolute-ceiling');
+    await settle();
+
+    expect(proc.kill).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op for sessions without an active container', () => {
+    killContainer('sess-unknown', 'absolute-ceiling');
+    expect(stopContainerAsync).not.toHaveBeenCalled();
+  });
+});
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {

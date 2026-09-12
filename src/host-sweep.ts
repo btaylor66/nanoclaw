@@ -364,6 +364,12 @@ function resetStuckProcessingRows(
     }
   }
 
+  // A host-side write to the container-owned outbound.db is only legal when
+  // no container is running (openOutboundDbRw contract, session-manager.ts).
+  // killContainer is async, so on the kill paths the container is still up
+  // here; sweep step 4 clears the claims on a later tick once it is gone.
+  if (!writableOutDb && isContainerRunning(session.id)) return;
+
   // Drop the orphan 'processing' rows. Without this, the next sweep tick
   // would re-read them, see the old status_changed timestamp, conclude the
   // freshly respawned container is stuck, and SIGKILL it before its
