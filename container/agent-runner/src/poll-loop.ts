@@ -122,10 +122,35 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   let isFirstPoll = true;
+  // Same policy the follow-up poll applies below: a driver-classified failure
+  // is tolerated until it repeats, then the runner exits 75 and the host
+  // respawns it. This read had no catch at all, so the first torn read across
+  // the host share reached main()'s handler and exited 1 — an idle container
+  // was killed by an event an active container survives ten of.
+  let idleFailureStreak = 0;
   while (true) {
     if (config.signal?.aborted) return;
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    let messages: MessageInRow[];
+    try {
+      messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+      idleFailureStreak = 0;
+    } catch (err) {
+      // Anything the driver does not own is still fatal — don't swallow a
+      // programming error into an infinite quiet retry.
+      if (!getAgentMailbox().shouldRestartAfter?.(err)) throw err;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      idleFailureStreak += 1;
+      log(`Idle poll read failed (${idleFailureStreak}/${MAILBOX_FAILURE_STREAK_EXIT}): ${errMsg}`);
+      if (idleFailureStreak >= MAILBOX_FAILURE_STREAK_EXIT) {
+        log('Idle poll: mailbox driver requested a fresh runner. Exiting so the host respawns it.');
+        process.exit(75);
+      }
+      // isFirstPoll is deliberately NOT cleared: the first poll's on_wake
+      // batch still has to be delivered once a read succeeds.
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
     isFirstPoll = false;
     pollCount++;
 
