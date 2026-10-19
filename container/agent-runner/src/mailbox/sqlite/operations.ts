@@ -1,4 +1,4 @@
-import { getInboundDb, getOutboundDb, openInboundDb } from './connection.js';
+import { getInboundDb, getOutboundDb, openInboundDb, withInboundDb } from './connection.js';
 import type { MessageInRow } from '../../db/messages-in.js';
 import type { MessageOutRow } from '../../db/messages-out.js';
 import {
@@ -22,14 +22,17 @@ export function sqliteTimestamp(value: string): string {
 function hasOnWakeColumn(db: ReturnType<typeof openInboundDb>): boolean {
   if (hasOnWake !== null) return hasOnWake;
   const columns = db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>;
+  // Don't memoize off a torn read. An empty column list means the PRAGMA saw a
+  // mid-commit image, not a table without on_wake — and caching `false` here
+  // would silently drop on_wake filtering for the life of the process.
+  if (columns.length === 0) return false;
   hasOnWake = columns.some(({ name }) => name === 'on_wake');
   return hasOnWake;
 }
 
 export function sqliteGetPendingMessages(isFirstPoll: boolean, limit: number): MessageInRow[] {
-  const inbound = openInboundDb();
   const outbound = getOutboundDb();
-  try {
+  return withInboundDb((inbound) => {
     const onWakeFilter = hasOnWakeColumn(inbound) ? 'AND (on_wake = 0 OR ?1 = 1)' : '';
     const pending = inbound
       .prepare(
@@ -51,9 +54,7 @@ export function sqliteGetPendingMessages(isFirstPoll: boolean, limit: number): M
     const remaining = limit - wake.length;
     const context = remaining > 0 ? unclaimed.filter(({ trigger }) => trigger === 0).slice(-remaining) : [];
     return [...wake, ...context].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-  } finally {
-    inbound.close();
-  }
+  });
 }
 
 function mark(ids: string[], status: string): void {
@@ -92,37 +93,29 @@ export function sqliteMarkScriptSkipped(skips: Array<{ id: string; reason: strin
 }
 
 export function sqliteGetMessageIn(id: string): MessageInRow | undefined {
-  const inbound = openInboundDb();
-  try {
-    return inbound.prepare('SELECT * FROM messages_in WHERE id = ?').get(id) as MessageInRow | undefined;
-  } finally {
-    inbound.close();
-  }
+  return withInboundDb(
+    (inbound) => inbound.prepare('SELECT * FROM messages_in WHERE id = ?').get(id) as MessageInRow | undefined,
+  );
 }
 
 export function sqliteFindQuestionResponse(questionId: string): MessageInRow | undefined {
-  const inbound = openInboundDb();
-  try {
+  return withInboundDb((inbound) => {
     const response = inbound
       .prepare("SELECT * FROM messages_in WHERE status = 'pending' AND content LIKE ?")
       .get(`%"questionId":"${questionId}"%`) as MessageInRow | undefined;
     if (!response) return undefined;
     const acknowledged = getOutboundDb().prepare('SELECT 1 FROM processing_ack WHERE message_id = ?').get(response.id);
     return acknowledged ? undefined : response;
-  } finally {
-    inbound.close();
-  }
+  });
 }
 
 export function sqliteFindCliResponse(requestId: string): MessageInRow | undefined {
-  const inbound = openInboundDb();
-  try {
-    return inbound
-      .prepare("SELECT * FROM messages_in WHERE status = 'pending' AND content LIKE ?")
-      .get(`%"requestId":"${requestId}"%`) as MessageInRow | undefined;
-  } finally {
-    inbound.close();
-  }
+  return withInboundDb(
+    (inbound) =>
+      inbound
+        .prepare("SELECT * FROM messages_in WHERE status = 'pending' AND content LIKE ?")
+        .get(`%"requestId":"${requestId}"%`) as MessageInRow | undefined,
+  );
 }
 
 export function sqliteWriteMessageOut(message: OutboundWrite): number {

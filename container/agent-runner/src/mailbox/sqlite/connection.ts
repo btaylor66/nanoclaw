@@ -58,6 +58,92 @@ export function openInboundDb(): Database {
 }
 
 /**
+ * SQLite codes a torn read across the host share produces, but a settled
+ * re-read of the same (intact) file does not.
+ *
+ * The session mailbox lives on a virtualized share (see the header note on
+ * mmap coherency). With journal_mode=DELETE the host mutates inbound.db in
+ * place and relies on POSIX advisory locks to keep readers out of a commit;
+ * a share that does not carry those faithfully lets a reader land mid-commit
+ * and see a page set that does not agree with itself. SQLITE_CORRUPT is the
+ * common result, NOTADB the same event hitting the header, IOERR/BUSY a lock
+ * or short read the mount dropped. None of them mean the file is damaged.
+ *
+ * Deliberately NOT retried: SQLITE_READONLY, SQLITE_CANTOPEN, SQLITE_PERM,
+ * SQLITE_NOTFOUND. Those describe a condition a 50 ms wait cannot change, so
+ * retrying them only delays a real error.
+ */
+const TRANSIENT_READ_CODES = new Set([
+  'SQLITE_CORRUPT',
+  'SQLITE_NOTADB',
+  'SQLITE_IOERR',
+  'SQLITE_BUSY',
+]);
+
+function isTransientRead(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && TRANSIENT_READ_CODES.has(code)) return true;
+  // bun:sqlite does not set .code on every throw path, so the message is the
+  // remaining discriminator. These are the same strings the driver's
+  // shouldRestartAfter() already matches on (mailbox/sqlite/index.ts).
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('database disk image is malformed') ||
+    message.includes('file is not a database')
+  );
+}
+
+/**
+ * Run a short-lived read against inbound.db, retrying a torn cross-mount read.
+ *
+ * The handle is opened and closed per attempt on purpose: a connection that
+ * has already seen a corrupt page caches it, so reusing the handle re-reads
+ * the same bad image however long we wait.
+ *
+ * Synchronous because every caller is — bun:sqlite's API is sync and the poll
+ * loop calls these from sync code — hence Bun.sleepSync rather than a timer.
+ * The delay is linear (50 ms, then 100 ms), so a genuine failure still
+ * propagates within ~150 ms.
+ */
+export function withInboundDb<T>(read: (db: Database) => T, attempts = 3, delayMs = 50): T {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const db = openInboundDb();
+    try {
+      return read(db);
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts || !isTransientRead(error)) throw error;
+    } finally {
+      // A handle that hit a torn page can throw on close. The next attempt
+      // opens a fresh one, so there is nothing to recover here.
+      try {
+        db.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    Bun.sleepSync(delayMs * attempt);
+  }
+  throw lastError;
+}
+
+/**
+ * Drop the long-lived inbound handle so the next getInboundDb() reopens it.
+ * For the callers that hold the singleton rather than a per-read connection:
+ * once it has cached a corrupt page, only a reopen clears it.
+ */
+export function resetInboundDb(): void {
+  if (_testMode) return;
+  try {
+    _inbound?.close();
+  } catch {
+    /* already unusable */
+  }
+  _inbound = null;
+}
+
+/**
  * Inbound DB — long-lived singleton, OK for tables the host writes once
  * at spawn and never again (destinations, session_routing). For
  * messages_in polling — where the host writes continuously and a stale
